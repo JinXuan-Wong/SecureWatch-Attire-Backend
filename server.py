@@ -4460,26 +4460,29 @@ async def attire_notifications_stream(token: str = ""):
         ATTIRE_NOTIF_SUBS.add(sub)
         print("[NOTIF] SSE subscriber added. total =", len(ATTIRE_NOTIF_SUBS))
 
-    async def gen():
-        try:
-            with NOTIF_LOCK:
-                cfg = dict(ATTIRE_NOTIF_CFG)
+        async def gen():
+            try:
+                with NOTIF_LOCK:
+                    cfg = dict(ATTIRE_NOTIF_CFG)
 
-            print("[NOTIF] SSE sending config:", cfg)
-            yield f"event: config\ndata: {json.dumps(cfg)}\n\n"
+                # optional initial config event
+                yield f"event: config\ndata: {json.dumps(cfg)}\n\n"
 
-            while True:
-                try:
-                    item = await asyncio.wait_for(q.get(), timeout=15.0)
-                    print("[NOTIF] SSE sending notify:", item)
-                    yield f"event: notify\ndata: {json.dumps(item)}\n\n"
-                except asyncio.TimeoutError:
-                    print("[NOTIF] SSE sending ping")
-                    yield "event: ping\ndata: {}\n\n"
-        finally:
-            with ATTIRE_NOTIF_SUBS_LOCK:
-                ATTIRE_NOTIF_SUBS.discard(sub)
-                print("[NOTIF] SSE subscriber removed. total =", len(ATTIRE_NOTIF_SUBS))
+                while True:
+                    try:
+                        item = await asyncio.wait_for(q.get(), timeout=15.0)
+                        print("[NOTIF] SSE sending plain message:", item)
+
+                        # send as NORMAL SSE message (not custom notify event)
+                        yield f"data: {json.dumps(item)}\n\n"
+
+                    except asyncio.TimeoutError:
+                        print("[NOTIF] SSE sending ping")
+                        # comment line only, keeps connection alive
+                        yield ": ping\n\n"
+            finally:
+                with ATTIRE_NOTIF_SUBS_LOCK:
+                    ATTIRE_NOTIF_SUBS.discard(sub)
 
     return StreamingResponse(
         gen(),
