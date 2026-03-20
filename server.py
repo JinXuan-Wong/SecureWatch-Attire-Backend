@@ -1021,7 +1021,14 @@ ATTIRE_NOTIF_LAST_TS = {}  # (source_id, violation_type) -> unix_ts
 def _should_publish_notif(source_id: str, violation_type: str) -> bool:
     with NOTIF_LOCK:
         cfg = dict(ATTIRE_NOTIF_CFG)
+
+    print("[NOTIF] _should_publish_notif called",
+          "source_id=", source_id,
+          "violation_type=", violation_type,
+          "cfg=", cfg)
+
     if not cfg.get("enabled", True):
+        print("[NOTIF] blocked: notifications disabled")
         return False
 
     cd = float(cfg.get("cooldown_sec", 30) or 0)
@@ -1030,10 +1037,22 @@ def _should_publish_notif(source_id: str, violation_type: str) -> bool:
 
     with ATTIRE_NOTIF_LAST_TS_LOCK:
         last = ATTIRE_NOTIF_LAST_TS.get(key, 0.0)
-        if cd > 0 and (now - last) < cd:
+        diff = now - last
+
+        print("[NOTIF] cooldown check",
+              "key=", key,
+              "last=", last,
+              "now=", now,
+              "diff=", diff,
+              "cooldown=", cd)
+
+        if cd > 0 and diff < cd:
+            print("[NOTIF] blocked by cooldown")
             return False
+
         ATTIRE_NOTIF_LAST_TS[key] = now
 
+    print("[NOTIF] allowed")
     return True
 
 def _publish_attire_notification(payload: dict) -> None:
@@ -4428,7 +4447,10 @@ def set_attire_notifications_cfg(payload: dict = Body(...), user=Depends(get_cur
 async def attire_notifications_stream(token: str = ""):
     user = get_current_user_from_token(token)
     if not user:
+        print("[NOTIF] SSE rejected: invalid token")
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+    print("[NOTIF] SSE connect attempt by user:", user.get("username") if isinstance(user, dict) else user)
 
     q: asyncio.Queue = asyncio.Queue(maxsize=50)
     loop = asyncio.get_running_loop()
@@ -4436,22 +4458,28 @@ async def attire_notifications_stream(token: str = ""):
 
     with ATTIRE_NOTIF_SUBS_LOCK:
         ATTIRE_NOTIF_SUBS.add(sub)
+        print("[NOTIF] SSE subscriber added. total =", len(ATTIRE_NOTIF_SUBS))
 
     async def gen():
         try:
             with NOTIF_LOCK:
                 cfg = dict(ATTIRE_NOTIF_CFG)
+
+            print("[NOTIF] SSE sending config:", cfg)
             yield f"event: config\ndata: {json.dumps(cfg)}\n\n"
 
             while True:
                 try:
                     item = await asyncio.wait_for(q.get(), timeout=15.0)
+                    print("[NOTIF] SSE sending notify:", item)
                     yield f"event: notify\ndata: {json.dumps(item)}\n\n"
                 except asyncio.TimeoutError:
+                    print("[NOTIF] SSE sending ping")
                     yield "event: ping\ndata: {}\n\n"
         finally:
             with ATTIRE_NOTIF_SUBS_LOCK:
                 ATTIRE_NOTIF_SUBS.discard(sub)
+                print("[NOTIF] SSE subscriber removed. total =", len(ATTIRE_NOTIF_SUBS))
 
     return StreamingResponse(
         gen(),
