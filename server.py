@@ -623,25 +623,52 @@ def _live_event_key(source_id: str, view: str, label: str, track_id=None):
 
 def _write_attire_event_common(
     *,
-    source_id: str,
-    source_name: str,
-    view_name: str,
-    label: str,
+    source_id: str,         # "webcam" / "vid-xxxx" / "rtsp-xxx"
+    source_name: str,       # display name for UI
+    view_name: str,         # "normal"/"entrance"/...
+    label: str,             # "sleeveless"/"shorts"/"slippers"
     conf: float,
     frame_bgr,
-    bbox_xyxy,
+    bbox_xyxy,              # [x1,y1,x2,y2] in PIXELS (relative to frame_bgr)
     track_id=None,
-    source_type: str,
-    evidence_kind: str,
-    id_prefix: str,
+    source_type: str,       # "Live Detection" or "Uploaded Video"
+    evidence_kind: str,     # "live" or "offline" or "rtsp"
+    id_prefix: str,         # "live"/"offline"/"rtsp"
 ):
     now_s = int(time.time())
+    key = _live_event_key(source_id, view_name or "normal", label, track_id)
+    _prune_attire_events_by_retention()
     
-    # Save evidence and event as usual
+    with LIVE_EVENT_STATE_LOCK:
+        st = LIVE_EVENT_STATE.get(key) or {"count": 0, "last_ts": 0}
+
+        # cooldown
+        if (now_s - int(st["last_ts"])) < int(LIVE_COOLDOWN_SEC):
+            st["count"] = 0
+            LIVE_EVENT_STATE[key] = st
+            return None
+
+        # persistence frames
+        st["count"] = int(st["count"]) + 1
+        if st["count"] < int(LIVE_PERSIST_FRAMES):
+            LIVE_EVENT_STATE[key] = st
+            return None
+
+        # trigger
+        st["count"] = 0
+        st["last_ts"] = now_s
+        LIVE_EVENT_STATE[key] = st
+
     filename = f"{now_s}_{uuid.uuid4().hex[:8]}.jpg"
     out_path = os.path.join(VIOLATIONS_DIR, evidence_kind, source_id, filename)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    cv2.imwrite(out_path, frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+
+    try:
+        _save_crop_evidence_whole_person(frame_bgr, bbox_xyxy, label, out_path)
+    except Exception:
+        cv2.imwrite(out_path, frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+
+    evidence_url = f"/violations/{evidence_kind}/{source_id}/{filename}"
 
     new_event = {
         "id": f"{id_prefix}-{source_id}-{uuid.uuid4().hex[:8]}",
@@ -650,36 +677,63 @@ def _write_attire_event_common(
         "label": label,
         "view": view_name or "normal",
         "ts": now_s,
-        "conf": conf,
+        "conf": float(conf) if conf is not None else None,
         "severity": "High",
-        "evidence_url": f"/violations/{evidence_kind}/{source_id}/{filename}",
+        "evidence_url": evidence_url,
         "status": "Pending",
+        "resolved_ts": None,
+        "location": view_name or "normal",
         "notes": "",
         "source": source_type,
         "person_id": track_id,
     }
 
-    # Save to JSON
     with ATTIRE_EVENTS_LOCK:
         ATTIRE_EVENTS.append(new_event)
         if len(ATTIRE_EVENTS) > 5000:
             ATTIRE_EVENTS[:] = ATTIRE_EVENTS[-5000:]
         _save_attire_events_file(ATTIRE_EVENTS)
+        # Publish notification (rate-limited)
+        try:
+            sid = new_event.get("video_id") or "unknown"
+            vtype = new_event.get("label") or "unknown"
+            print("[NOTIF] event created:",
+                "id=", new_event.get("id"),
+                "video_id=", new_event.get("video_id"),
+                "label=", new_event.get("label"),
+                "status=", new_event.get("status"))
 
-    # ---- Always notify, no cooldown ----
-    try:
-        payload = {
-            "id": new_event["id"],
-            "source_id": source_id,
-            "source_name": source_name,
-            "violation_type": label,
-            "timestamp": now_s,
-            "event_id": new_event["id"],
-        }
-        _publish_attire_notification(payload)
-        print("[NOTIF] Published notification:", payload)
-    except Exception as e:
-        print("[NOTIF] Failed to publish:", e)
+            ok_notif = _should_publish_notif(sid, vtype)
+
+            print("[NOTIF] should_publish =",
+                ok_notif,
+                "sid=", sid,
+                "type=", vtype)
+
+            if ok_notif:
+                with ATTIRE_NOTIF_SUBS_LOCK:
+                    sub_count = len(ATTIRE_NOTIF_SUBS)
+
+                print("[NOTIF] publishing to subscribers:", sub_count)
+
+                payload = {
+                    "id": new_event["id"],
+                    "source_id": sid,
+                    "source_name": source_name,
+                    "violation_type": vtype,
+                    "timestamp": new_event["ts"],
+                    "event_id": new_event["id"],
+                }
+
+                print("[NOTIF] payload:", payload)
+
+                _publish_attire_notification(payload)
+            else:
+                print("[NOTIF] notification suppressed",
+                    "sid=", sid,
+                    "type=", vtype)
+        except Exception:
+            pass
 
     return new_event
 
