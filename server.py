@@ -3761,21 +3761,17 @@ def export_attire_csv(start: str = "", end: str = "", vtype: str = "All", status
         headers={"Content-Disposition": 'attachment; filename="attire_report.csv"'}
     )
 
-@app.get("/api/attire/reports/export.pdf")
+@app.post("/api/attire/reports/export.pdf")
 def export_attire_pdf(
-    start: str = "",
-    end: str = "",
-    vtype: str = "All",
-    status: str = "All",
-    video_id: str = "",
+    payload: dict = Body(default={})
 ):
     import io
-    from datetime import datetime, timedelta
+    import base64
+    from datetime import datetime
 
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.lib import colors
-        from reportlab.lib.colors import HexColor
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib.units import cm
         from reportlab.platypus import (
@@ -3784,15 +3780,17 @@ def export_attire_pdf(
             Spacer,
             Table,
             TableStyle,
-            KeepTogether,
+            Image as RLImage,
         )
-        from reportlab.graphics.shapes import Drawing, String, Rect
-        from reportlab.platypus import Image as RLImage
-        from reportlab.graphics.charts.barcharts import VerticalBarChart
-        from reportlab.graphics.charts.linecharts import HorizontalLineChart
-        from reportlab.graphics.charts.piecharts import Pie
     except Exception:
         raise HTTPException(status_code=501, detail="reportlab not installed")
+
+    start = str(payload.get("start", "") or "")
+    end = str(payload.get("end", "") or "")
+    vtype = str(payload.get("vtype", "All") or "All")
+    status = str(payload.get("status", "All") or "All")
+    video_id = str(payload.get("video_id", "") or "")
+    chart_image = payload.get("chart_image")
 
     r = attire_reports(
         start=start,
@@ -3883,7 +3881,7 @@ def export_attire_pdf(
         except Exception:
             return "-"
 
-    def _label_title_local(label: str) -> str:
+    def _label_title(label: str) -> str:
         s0 = str(label or "").lower()
         if "sleeveless" in s0:
             return "Sleeveless"
@@ -3894,176 +3892,23 @@ def export_attire_pdf(
         return str(label or "Unknown").replace("_", " ").title()
 
     def _format_location(e: dict) -> str:
-        src_name = e.get("video_name") or e.get("video_id") or "Unknown"
-        view_name = e.get("view") or e.get("location") or "normal"
+        src_name = (
+            e.get("video_name")
+            or e.get("video_id")
+            or "Unknown"
+        )
+
+        view_name = (
+            e.get("view")
+            or e.get("location")
+            or "normal"
+        )
+
         return f"{src_name}, {view_name}"
-
-    def _empty_chart(width: float, height: float, text: str = "No data available"):
-        d = Drawing(width, height)
-        d.add(Rect(0, 0, width, height, fillColor=HexColor("#0B1730"), strokeColor=HexColor("#1E293B")))
-        d.add(String(
-            width / 2.0,
-            height / 2.0,
-            text,
-            textAnchor="middle",
-            fontName="Helvetica",
-            fontSize=11,
-            fillColor=HexColor("#94A3B8"),
-        ))
-        return d
-
-    def _chart_panel(title: str, drawing: Drawing, panel_width: float):
-        title_para = Paragraph(
-            title,
-            ParagraphStyle(
-                f"PanelTitle_{title}",
-                parent=styles["Normal"],
-                fontName="Helvetica-Bold",
-                fontSize=9.5,
-                textColor=colors.white,
-                spaceAfter=4,
-            ),
-        )
-        panel = Table(
-            [[title_para], [drawing]],
-            colWidths=[panel_width],
-        )
-        panel.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, -1), HexColor("#0B1730")),
-            ("BOX", (0, 0), (-1, -1), 0.8, HexColor("#1E293B")),
-            ("LEFTPADDING", (0, 0), (-1, -1), 8),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-            ("TOPPADDING", (0, 0), (-1, -1), 8),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-        ]))
-        return panel
-
-    def _build_bar_chart(data, width: float, height: float):
-        if not data:
-            return _empty_chart(width, height)
-
-        d = Drawing(width, height)
-        chart = VerticalBarChart()
-        chart.x = 30
-        chart.y = 22
-        chart.width = width - 45
-        chart.height = height - 35
-        chart.data = [[int(x.get("count", 0) or 0) for x in data]]
-        chart.categoryAxis.categoryNames = [str(x.get("name", "")) for x in data]
-        chart.valueAxis.valueMin = 0
-        chart.valueAxis.forceZero = 1
-        chart.barWidth = 18
-        chart.groupSpacing = 14
-        chart.barSpacing = 6
-
-        chart.strokeColor = HexColor("#334155")
-        chart.categoryAxis.strokeColor = HexColor("#475569")
-        chart.valueAxis.strokeColor = HexColor("#475569")
-
-        chart.categoryAxis.labels.fontName = "Helvetica"
-        chart.categoryAxis.labels.fontSize = 7
-        chart.categoryAxis.labels.fillColor = HexColor("#94A3B8")
-
-        chart.valueAxis.labels.fontName = "Helvetica"
-        chart.valueAxis.labels.fontSize = 7
-        chart.valueAxis.labels.fillColor = HexColor("#94A3B8")
-
-        chart.bars[0].fillColor = HexColor("#F97316")
-        chart.bars[0].strokeColor = HexColor("#F97316")
-
-        d.add(chart)
-        return d
-
-    def _build_daily_trend_chart(events_list, width: float, height: float):
-        try:
-            end_dt = datetime.strptime(end, "%Y-%m-%d") if end else datetime.now()
-        except Exception:
-            end_dt = datetime.now()
-
-        end_dt = end_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-
-        counts = {}
-        for e in events_list:
-            try:
-                dt = datetime.fromtimestamp(int(e.get("ts", 0) or 0)).replace(
-                    hour=0, minute=0, second=0, microsecond=0
-                )
-                key = dt.strftime("%Y-%m-%d")
-                counts[key] = counts.get(key, 0) + 1
-            except Exception:
-                pass
-
-        labels = []
-        values = []
-        for i in range(7, -1, -1):
-            d0 = end_dt - timedelta(days=i)
-            key = d0.strftime("%Y-%m-%d")
-            labels.append(d0.strftime("%m-%d"))
-            values.append(int(counts.get(key, 0)))
-
-        if not any(values):
-            return _empty_chart(width, height)
-
-        d = Drawing(width, height)
-        chart = HorizontalLineChart()
-        chart.x = 30
-        chart.y = 22
-        chart.width = width - 45
-        chart.height = height - 35
-        chart.data = [values]
-        chart.categoryAxis.categoryNames = labels
-        chart.valueAxis.valueMin = 0
-        chart.valueAxis.forceZero = 1
-        chart.joinedLines = 1
-
-        chart.categoryAxis.strokeColor = HexColor("#475569")
-        chart.valueAxis.strokeColor = HexColor("#475569")
-
-        chart.categoryAxis.labels.fontName = "Helvetica"
-        chart.categoryAxis.labels.fontSize = 7
-        chart.categoryAxis.labels.fillColor = HexColor("#94A3B8")
-
-        chart.valueAxis.labels.fontName = "Helvetica"
-        chart.valueAxis.labels.fontSize = 7
-        chart.valueAxis.labels.fillColor = HexColor("#94A3B8")
-
-        chart.lines[0].strokeColor = HexColor("#EF4444")
-        chart.lines[0].strokeWidth = 2
-        chart.lines[0].symbol = None
-
-        d.add(chart)
-        return d
-
-    def _build_status_pie(resolved_count: int, pending_count: int, width: float, height: float):
-        total = int(resolved_count) + int(pending_count)
-        if total <= 0:
-            return _empty_chart(width, height)
-
-        d = Drawing(width, height)
-
-        pie = Pie()
-        pie.width = 95
-        pie.height = 95
-        pie.x = (width - pie.width) / 2
-        pie.y = (height - pie.height) / 2 - 5
-        pie.data = [int(pending_count), int(resolved_count)]
-        pie.labels = [
-            f"Pending: {round((pending_count / total) * 100)}%",
-            f"Resolved: {round((resolved_count / total) * 100)}%",
-        ]
-        pie.sideLabels = True
-        pie.simpleLabels = False
-        pie.slices.strokeWidth = 0.4
-        pie.slices[0].fillColor = HexColor("#EF4444")
-        pie.slices[0].strokeColor = HexColor("#EF4444")
-        pie.slices[1].fillColor = HexColor("#10B981")
-        pie.slices[1].strokeColor = HexColor("#10B981")
-
-        d.add(pie)
-        return d
 
     story = []
 
+    # Title
     story.append(Paragraph("Attire Compliance Report", title_style))
     story.append(
         Paragraph(
@@ -4078,6 +3923,7 @@ def export_attire_pdf(
         )
     )
 
+    # Summary cards
     card_label = ParagraphStyle(
         "CardLabel",
         parent=styles["Normal"],
@@ -4133,9 +3979,11 @@ def export_attire_pdf(
             ]
         )
     )
+
     story.append(cards)
     story.append(Spacer(1, 10))
 
+    # Most frequent violation
     story.append(Paragraph("Most Frequent Violation", h2_style))
     badge = Table(
         [[P(most_frequent, ParagraphStyle(
@@ -4163,37 +4011,21 @@ def export_attire_pdf(
     story.append(badge)
     story.append(Spacer(1, 12))
 
-    # --- Compact charts section below Most Frequent Violation ---
-    freq_data = r.get("charts", {}).get("type_frequency", []) or []
+    # Insert ONLY charts screenshot here
+    if chart_image:
+        try:
+            if isinstance(chart_image, str) and "," in chart_image:
+                chart_image = chart_image.split(",", 1)[1]
 
-    chart_gap = 8
-    half_width = (doc.width - chart_gap) / 2.0
+            img_bytes = base64.b64decode(chart_image)
+            img_buf = io.BytesIO(img_bytes)
 
-    bar_chart = _build_bar_chart(freq_data, half_width - 16, 120)
-    trend_chart = _build_daily_trend_chart(events, half_width - 16, 120)
-    pie_chart = _build_status_pie(resolved, pending, doc.width - 16, 135)
-
-    top_row = Table(
-        [[
-            _chart_panel("Violation Type Frequency", bar_chart, half_width),
-            _chart_panel("Last 8 Days Trend", trend_chart, half_width),
-        ]],
-        colWidths=[half_width, half_width],
-    )
-    top_row.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 0),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-    ]))
-
-    bottom_row = _chart_panel("Status Distribution", pie_chart, doc.width)
-
-    story.append(top_row)
-    story.append(Spacer(1, 8))
-    story.append(bottom_row)
-    story.append(Spacer(1, 12))
+            chart_pdf_img = RLImage(img_buf)
+            chart_pdf_img._restrictSize(doc.width, 11.0 * cm)
+            story.append(chart_pdf_img)
+            story.append(Spacer(1, 12))
+        except Exception as e:
+            print(f"[ATTIRE PDF] failed to embed chart image: {e}")
 
     # Historical Violations table
     story.append(Paragraph("Historical Violations", h2_style))
@@ -4209,7 +4041,7 @@ def export_attire_pdf(
 
     for e in events[:200]:
         rows.append([
-            _label_title_local(e.get("label", "")),
+            _label_title(e.get("label", "")),
             _format_location(e),
             str(e.get("status", "Pending") or "Pending"),
             _fmt_dt(e.get("ts", 0)),
