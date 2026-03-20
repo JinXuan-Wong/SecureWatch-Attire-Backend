@@ -1029,6 +1029,10 @@ VIDEOS = {}    # video_id -> {"path": "...", "name": "..."}
 LIVE_SESSIONS = {}  # video_id -> LiveVideoSession
 LIVE_LOCK = threading.Lock()
 
+THUMB_CACHE_LOCK = threading.Lock()
+THUMB_CACHE = {}  # key -> {"ts": float, "jpg": bytes}
+THUMB_TTL_SEC = 8.0
+
 # ----------------------------
 # Live session janitor (idle cleanup)
 # ----------------------------
@@ -1204,6 +1208,21 @@ def _iter_boxes_from_raw(raw):
                 yield [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])], str(label), float(conf)
             return
         
+def _thumb_cache_get(key: str):
+    now = time.time()
+    with THUMB_CACHE_LOCK:
+        item = THUMB_CACHE.get(key)
+        if not item:
+            return None
+        if (now - float(item.get("ts", 0.0))) > THUMB_TTL_SEC:
+            THUMB_CACHE.pop(key, None)
+            return None
+        return item.get("jpg")
+
+def _thumb_cache_set(key: str, jpg: bytes):
+    with THUMB_CACHE_LOCK:
+        THUMB_CACHE[key] = {"ts": time.time(), "jpg": jpg}
+
 # --- ROI helpers ---
 def _bbox_inside_any_roi_percent(bbox_xyxy, roi_polys_percent, img_w, img_h, mode="center"):
     """
@@ -3063,11 +3082,6 @@ def offline_live_detections(video_id: str):
     
 @app.get("/api/rtsp/thumb/{rtsp_id}")
 def rtsp_thumb(rtsp_id: str):
-    """
-    Dashboard thumbnail:
-    1) If a live session already exists, reuse its latest dewarped JPEG
-    2) Otherwise fallback to one-shot dewarped snapshot
-    """
     cfg = _get_rtsp(rtsp_id)
     url = (cfg.get("url") or "").strip()
     if not url:
@@ -3080,23 +3094,32 @@ def rtsp_thumb(rtsp_id: str):
             with sess.lock:
                 jpg = sess.latest_jpeg
             if jpg:
+                _thumb_cache_set(f"rtsp:{rtsp_id}", jpg)
                 return Response(
                     content=jpg,
                     media_type="image/jpeg",
                     headers={"Cache-Control": "no-store, max-age=0"},
                 )
 
-    # fallback: use existing dewarped snapshot endpoint logic
-    return rtsp_snapshot_dewarp(rtsp_id)
+    cached = _thumb_cache_get(f"rtsp:{rtsp_id}")
+    if cached:
+        return Response(
+            content=cached,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
 
+    resp = rtsp_snapshot_dewarp(rtsp_id)
+    try:
+        body = resp.body
+        if body:
+            _thumb_cache_set(f"rtsp:{rtsp_id}", body)
+    except Exception:
+        pass
+    return resp
 
 @app.get("/api/offline/thumb/{video_id}")
 def offline_thumb(video_id: str):
-    """
-    Dashboard thumbnail:
-    1) If a live session already exists, reuse latest dewarped JPEG
-    2) Otherwise fallback to one-shot dewarped snapshot
-    """
     matches = list(Path(UPLOAD_DIR).glob(f"{video_id}__*"))
     if not matches:
         raise HTTPException(status_code=404, detail="Uploaded video not found")
@@ -3108,13 +3131,29 @@ def offline_thumb(video_id: str):
             with sess.lock:
                 jpg = sess.latest_jpeg
             if jpg:
+                _thumb_cache_set(f"offline:{video_id}", jpg)
                 return Response(
                     content=jpg,
                     media_type="image/jpeg",
                     headers={"Cache-Control": "no-store, max-age=0"},
                 )
 
-    return snapshot_dewarp(video_id)
+    cached = _thumb_cache_get(f"offline:{video_id}")
+    if cached:
+        return Response(
+            content=cached,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
+
+    resp = snapshot_dewarp(video_id)
+    try:
+        body = resp.body
+        if body:
+            _thumb_cache_set(f"offline:{video_id}", body)
+    except Exception:
+        pass
+    return resp
     
 # ----------------------------
 # API: ROI
