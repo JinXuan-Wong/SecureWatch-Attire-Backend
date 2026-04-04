@@ -465,33 +465,101 @@ def _set_enabled_violation_map(enabled: dict) -> dict:
     return cleaned
 
 # ----------------------------
-# Persistent Store: Attire Events (JSON) 
+# Persistent Store: Attire Events (Sharded JSON)
 # ----------------------------
-ATTIRE_EVENTS_PATH = str(HERE / "attire_events.json")
+ATTIRE_EVENTS_DIR = str(HERE / "attire_events_store")
 ATTIRE_EVENTS_LOCK = threading.Lock()
 
-def _load_attire_events_file() -> list:
+ATTIRE_EVENTS_PER_FILE = 20_000
+ATTIRE_EVENTS_FILE_PREFIX = "attire_events_"
+ATTIRE_EVENTS_FILE_SUFFIX = ".json"
+
+os.makedirs(ATTIRE_EVENTS_DIR, exist_ok=True)
+
+def _event_shard_path(index: int) -> str:
+    return os.path.join(
+        ATTIRE_EVENTS_DIR,
+        f"{ATTIRE_EVENTS_FILE_PREFIX}{index:06d}{ATTIRE_EVENTS_FILE_SUFFIX}"
+    )
+
+def _list_event_shard_paths() -> List[str]:
+    paths = sorted(Path(ATTIRE_EVENTS_DIR).glob(f"{ATTIRE_EVENTS_FILE_PREFIX}*{ATTIRE_EVENTS_FILE_SUFFIX}"))
+    return [str(p) for p in paths]
+
+def _load_event_shard(path: str) -> list:
     try:
-        if os.path.exists(ATTIRE_EVENTS_PATH):
-            with open(ATTIRE_EVENTS_PATH, "r", encoding="utf-8") as f:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             return data if isinstance(data, list) else []
     except Exception:
         pass
     return []
 
-def _save_attire_events_file(items: list) -> None:
+def _save_event_shard(path: str, items: list) -> None:
     try:
-        tmp = ATTIRE_EVENTS_PATH + ".tmp"
+        tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(items, f, indent=2)
-        os.replace(tmp, ATTIRE_EVENTS_PATH)
+        os.replace(tmp, path)
     except Exception:
         pass
 
-# load once at startup (keeps same ATTIRE_EVENTS variable you already use)
-with ATTIRE_EVENTS_LOCK:
-    ATTIRE_EVENTS = _load_attire_events_file()
+def _get_last_event_shard_info() -> Tuple[int, str]:
+    paths = _list_event_shard_paths()
+    if not paths:
+        idx = 1
+        path = _event_shard_path(idx)
+        _save_event_shard(path, [])
+        return idx, path
+
+    last_path = paths[-1]
+    stem = Path(last_path).stem  # attire_events_000001
+    try:
+        idx = int(stem.replace(ATTIRE_EVENTS_FILE_PREFIX, ""))
+    except Exception:
+        idx = len(paths)
+    return idx, last_path
+
+def _load_all_attire_events() -> list:
+    out = []
+    for path in _list_event_shard_paths():
+        out.extend(_load_event_shard(path))
+    return out
+
+def _append_attire_event(new_event: dict) -> dict:
+    idx, last_path = _get_last_event_shard_info()
+    items = _load_event_shard(last_path)
+
+    if len(items) >= ATTIRE_EVENTS_PER_FILE:
+        idx += 1
+        last_path = _event_shard_path(idx)
+        items = []
+
+    new_event["storage_shard"] = idx
+    items.append(new_event)
+    _save_event_shard(last_path, items)
+    return new_event
+
+def _rewrite_all_attire_events(events: list) -> None:
+    # clear old shard files
+    for path in _list_event_shard_paths():
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+    if not events:
+        _save_event_shard(_event_shard_path(1), [])
+        return
+
+    shard_idx = 1
+    for i in range(0, len(events), ATTIRE_EVENTS_PER_FILE):
+        chunk = events[i:i + ATTIRE_EVENTS_PER_FILE]
+        for ev in chunk:
+            ev["storage_shard"] = shard_idx
+        _save_event_shard(_event_shard_path(shard_idx), chunk)
+        shard_idx += 1
 
 # ----------------------------
 # Persistent Store: Data Retention
@@ -555,10 +623,6 @@ def _event_evidence_abs_path(ev: dict) -> str:
     return os.path.join(VIOLATIONS_DIR, rel)
 
 def _prune_attire_events_by_retention() -> int:
-    """
-    Remove expired attire events and their evidence files based on retention_days.
-    Returns number of deleted events.
-    """
     if not _is_retention_enabled():
         return 0
 
@@ -566,22 +630,22 @@ def _prune_attire_events_by_retention() -> int:
     removed = []
 
     with ATTIRE_EVENTS_LOCK:
-        if not ATTIRE_EVENTS:
+        all_events = _load_all_attire_events()
+        if not all_events:
             return 0
 
         kept = []
-        for ev in ATTIRE_EVENTS:
+        for ev in all_events:
             ts = int(ev.get("ts", 0) or 0)
             if ts < cutoff_ts:
                 removed.append(ev)
             else:
                 kept.append(ev)
 
-        if len(kept) == len(ATTIRE_EVENTS):
+        if len(kept) == len(all_events):
             return 0
 
-        ATTIRE_EVENTS[:] = kept
-        _save_attire_events_file(ATTIRE_EVENTS)
+        _rewrite_all_attire_events(kept)
 
     for ev in removed:
         _safe_remove_file(_event_evidence_abs_path(ev))
@@ -592,11 +656,17 @@ def _clear_all_attire_events_and_evidence() -> dict:
     removed_count = 0
 
     with ATTIRE_EVENTS_LOCK:
-        removed_count = len(ATTIRE_EVENTS)
-        ATTIRE_EVENTS[:] = []
-        _save_attire_events_file(ATTIRE_EVENTS)
+        all_events = _load_all_attire_events()
+        removed_count = len(all_events)
 
-    # remove all evidence folders for attire
+        for path in _list_event_shard_paths():
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+        _save_event_shard(_event_shard_path(1), [])
+
     for sub in ("live", "offline", "rtsp"):
         subdir = os.path.join(VIOLATIONS_DIR, sub)
         try:
@@ -606,7 +676,6 @@ def _clear_all_attire_events_and_evidence() -> dict:
         except Exception:
             pass
 
-    # reset runtime dedupe / cooldown states too
     with LIVE_EVENT_STATE_LOCK:
         LIVE_EVENT_STATE.clear()
 
@@ -669,7 +738,22 @@ def _write_attire_event_common(
         LIVE_EVENT_STATE[key] = st
 
     filename = f"{now_s}_{uuid.uuid4().hex[:8]}.jpg"
-    out_path = os.path.join(VIOLATIONS_DIR, evidence_kind, source_id, filename)
+
+    with ATTIRE_EVENTS_LOCK:
+        shard_idx, last_path = _get_last_event_shard_info()
+        current_items = _load_event_shard(last_path)
+        if len(current_items) >= ATTIRE_EVENTS_PER_FILE:
+            shard_idx += 1
+
+    shard_folder = f"shard_{shard_idx:06d}"
+
+    out_path = os.path.join(
+        VIOLATIONS_DIR,
+        evidence_kind,
+        source_id,
+        shard_folder,
+        filename
+    )
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     try:
@@ -677,7 +761,7 @@ def _write_attire_event_common(
     except Exception:
         cv2.imwrite(out_path, frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
 
-    evidence_url = f"/violations/{evidence_kind}/{source_id}/{filename}"
+    evidence_url = f"/violations/{evidence_kind}/{source_id}/{shard_folder}/{filename}"
 
     new_event = {
         "id": f"{id_prefix}-{source_id}-{uuid.uuid4().hex[:8]}",
@@ -698,10 +782,7 @@ def _write_attire_event_common(
     }
 
     with ATTIRE_EVENTS_LOCK:
-        ATTIRE_EVENTS.append(new_event)
-        if len(ATTIRE_EVENTS) > 5000:
-            ATTIRE_EVENTS[:] = ATTIRE_EVENTS[-5000:]
-        _save_attire_events_file(ATTIRE_EVENTS)
+        new_event = _append_attire_event(new_event)
         # Publish notification (rate-limited)
         try:
             sid = new_event.get("video_id") or "unknown"
@@ -2753,7 +2834,7 @@ def get_attire_events(video_id: str = "", limit: int = 1000):
     _prune_attire_events_by_retention()
 
     with ATTIRE_EVENTS_LOCK:
-        items = list(ATTIRE_EVENTS)
+        items = _load_all_attire_events()
 
     if video_id:
         items = [e for e in items if e.get("video_id") == video_id]
@@ -2770,14 +2851,15 @@ def clear_attire_events(video_id: str = ""):
 
     removed = []
     with ATTIRE_EVENTS_LOCK:
+        items = _load_all_attire_events()
         kept = []
-        for ev in ATTIRE_EVENTS:
+        for ev in items:
             if ev.get("video_id") == video_id:
                 removed.append(ev)
             else:
                 kept.append(ev)
-        ATTIRE_EVENTS[:] = kept
-        _save_attire_events_file(ATTIRE_EVENTS)
+
+        _rewrite_all_attire_events(kept)
 
     for ev in removed:
         _safe_remove_file(_event_evidence_abs_path(ev))
@@ -2798,14 +2880,15 @@ def patch_attire_event(event_id: str, body: dict = Body(...)):
         updates["status"] = s
 
     with ATTIRE_EVENTS_LOCK:
-        idx = next((i for i, e in enumerate(ATTIRE_EVENTS) if str(e.get("id")) == event_id), None)
+        items = _load_all_attire_events()
+        idx = next((i for i, e in enumerate(items) if str(e.get("id")) == event_id), None)
         if idx is None:
             raise HTTPException(status_code=404, detail="event not found")
 
-        ev = dict(ATTIRE_EVENTS[idx])
+        ev = dict(items[idx])
         ev.update({k: v for k, v in updates.items()})
-        ATTIRE_EVENTS[idx] = ev
-        _save_attire_events_file(ATTIRE_EVENTS)
+        items[idx] = ev
+        _rewrite_all_attire_events(items)
 
     return {"ok": True, "event": ev}
 
@@ -2813,12 +2896,15 @@ def patch_attire_event(event_id: str, body: dict = Body(...)):
 def delete_attire_event(event_id: str):
     """Delete a single event by id. Persists to attire_events.json."""
     with ATTIRE_EVENTS_LOCK:
-        before = len(ATTIRE_EVENTS)
-        ATTIRE_EVENTS[:] = [e for e in ATTIRE_EVENTS if str(e.get("id")) != event_id]
-        after = len(ATTIRE_EVENTS)
+        items = _load_all_attire_events()
+        before = len(items)
+        items = [e for e in items if str(e.get("id")) != event_id]
+        after = len(items)
+
         if after == before:
             raise HTTPException(status_code=404, detail="event not found")
-        _save_attire_events_file(ATTIRE_EVENTS)
+
+        _rewrite_all_attire_events(items)
     return {"ok": True, "deleted": event_id}
 
 # ----------------------------
@@ -3841,7 +3927,7 @@ def attire_dashboard():
     since_today = int(dt_mid.timestamp())
 
     with ATTIRE_EVENTS_LOCK:
-        items = list(ATTIRE_EVENTS)
+        items = _load_all_attire_events()
 
     def _get_vid(e: dict) -> str:
         # ✅ robust: supports older JSON schemas
@@ -3976,7 +4062,7 @@ def attire_reports(
         end_dt = end_dt.replace(hour=23, minute=59, second=59)
 
     with ATTIRE_EVENTS_LOCK:
-        items = list(ATTIRE_EVENTS)
+        items = _load_all_attire_events()
 
     # filter
     out = []
