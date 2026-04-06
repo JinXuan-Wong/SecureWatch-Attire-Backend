@@ -1,0 +1,8 @@
+{
+  "cam192": {
+    "mode": "fisheye"
+  },
+  "cam201": {
+    "mode": "normal"
+  }
+}

@@ -5525,9 +5525,34 @@ async def attire_notifications_stream(request: Request, token: str = ""):
 # --- Normal/Fisheye view mode ---
 @app.get("/api/attire/view-mode/{video_id}")
 def get_attire_view_mode(video_id: str):
+    saved_mode = _get_view_mode_for_video(video_id)
+
+    detected = False
+    try:
+        sess = None
+        with LIVE_LOCK:
+            sess = LIVE_SESSIONS.get(video_id)
+
+        if sess is not None:
+            detected = bool(getattr(sess, "_detected_is_fisheye", False))
+        else:
+            effective = (saved_mode == "fisheye")
+            if saved_mode == "auto":
+                effective = False
+            return {
+                "video_id": video_id,
+                "mode": saved_mode,
+                "effective_mode": "fisheye" if effective else "normal",
+            }
+    except Exception:
+        detected = False
+
+    effective, _ = _resolve_effective_fisheye(video_id, detected)
+
     return {
         "video_id": video_id,
-        "mode": _get_view_mode_for_video(video_id),
+        "mode": saved_mode,
+        "effective_mode": "fisheye" if effective else "normal",
     }
 
 @app.post("/api/attire/view-mode/{video_id}")
