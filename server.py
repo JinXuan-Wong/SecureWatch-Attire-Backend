@@ -1688,7 +1688,11 @@ def _decorate_attire_event(e: dict) -> dict:
         src_name = fallback_name or "Unknown Source"
 
     out["video_name"] = src_name
-    out["location"] = f"{src_name}, {view_label}"
+    saved_location = str(out.get("location") or "").strip()
+    if saved_location:
+        out["location"] = saved_location
+    else:
+        out["location"] = f"{src_name}, {view_label}"
     return out
 
 # ----------------------------
@@ -3513,7 +3517,7 @@ def clear_attire_events(video_id: str = ""):
 @app.patch("/api/attire/events/{event_id}")
 def patch_attire_event(event_id: str, body: dict = Body(...)):
     """Update a single event and persist resolved timestamp correctly."""
-    allowed = {"status", "location", "notes", "label", "severity", "source"}
+    allowed = {"status", "location", "notes", "label", "severity", "source", "view", "video_name"}
     updates = {k: body.get(k) for k in allowed if k in body}
 
     if "status" in updates:
@@ -3521,6 +3525,18 @@ def patch_attire_event(event_id: str, body: dict = Body(...)):
         if s not in {"Pending", "Resolved"}:
             raise HTTPException(status_code=400, detail="status must be Pending or Resolved")
         updates["status"] = s
+
+    if "label" in updates:
+        lab = str(updates["label"] or "").strip().lower()
+        if lab not in {"sleeveless", "shorts", "slippers"}:
+            raise HTTPException(status_code=400, detail="label must be sleeveless, shorts, or slippers")
+        updates["label"] = lab
+
+    if "view" in updates:
+        updates["view"] = str(updates["view"] or "").strip() or "normal"
+
+    if "video_name" in updates:
+        updates["video_name"] = str(updates["video_name"] or "").strip()
 
     with ATTIRE_EVENTS_LOCK:
         items = _load_all_attire_events()
