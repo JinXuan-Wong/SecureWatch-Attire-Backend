@@ -1,6 +1,6 @@
 {
   "enabled": true,
-  "cooldown_sec": 30,
+  "cooldown_sec": 205,
   "toast_sec": 4,
   "play_sound": true
 }

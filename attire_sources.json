@@ -94,5 +94,32 @@
   },
   "vid-e6bc972c": {
     "enabled": false
+  },
+  "vid-9438de36": {
+    "enabled": false
+  },
+  "camtest001": {
+    "enabled": false
+  },
+  "testcam": {
+    "enabled": true
+  },
+  "vid-90f5d75e": {
+    "enabled": false
+  },
+  "vid-8106b8eb": {
+    "enabled": false
+  },
+  "vid-6cf9f6fd": {
+    "enabled": false
+  },
+  "vid-9fa128e5": {
+    "enabled": false
+  },
+  "vid-a1b7ec06": {
+    "enabled": false
+  },
+  "vid-6b497040": {
+    "enabled": false
   }
 }

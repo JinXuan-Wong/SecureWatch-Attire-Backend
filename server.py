@@ -2822,6 +2822,13 @@ class LiveVideoSession:
     def stop(self):
         self.stop_event.set()
 
+        t = self.thread
+        if t and t.is_alive():
+            try:
+                t.join(timeout=2.5)
+            except Exception:
+                pass
+
     def snapshot(self):
         with self._lock:
             return {
@@ -3533,22 +3540,133 @@ def delete_video(video_id: str):
     if not matches:
         raise HTTPException(status_code=404, detail="Video not found")
 
+    # 1) Stop active live session first and wait for file handle release
     with LIVE_LOCK:
         sess = LIVE_SESSIONS.pop(video_id, None)
-        if sess:
+
+    if sess:
+        try:
             sess.stop()
+        except Exception:
+            pass
 
+    # small grace period for Windows file handle release
+    time.sleep(0.15)
+
+    deleted_files = 0
+    delete_errors = []
+
+    # 2) Delete uploaded file(s)
     for fp in matches:
-        fp.unlink(missing_ok=True)
+        try:
+            fp.unlink()
+            deleted_files += 1
+        except Exception as e:
+            delete_errors.append(f"{fp.name}: {e!s}")
 
+    if deleted_files <= 0:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Video file is still in use and could not be deleted",
+                "video_id": video_id,
+                "errors": delete_errors,
+            },
+        )
+
+    # 3) Remove runtime cache
     VIDEOS.pop(video_id, None)
-    # remove saved alias
+
+    # 4) Remove saved alias
     with LABELS_LOCK:
         if video_id in LABELS_BY_VIDEO:
             LABELS_BY_VIDEO.pop(video_id, None)
             _save_labels_file(LABELS_BY_VIDEO)
 
-    return {"ok": True, "deleted_id": video_id, "deleted_files": len(matches)}
+    # 5) Remove source enabled/disabled state
+    with SOURCES_LOCK:
+        if video_id in SOURCES_BY_VIDEO:
+            SOURCES_BY_VIDEO.pop(video_id, None)
+            _save_sources_file(SOURCES_BY_VIDEO)
+
+    # 6) Remove saved fps config
+    with FPS_LOCK:
+        if video_id in FPS_BY_VIDEO:
+            FPS_BY_VIDEO.pop(video_id, None)
+            _save_fps_file(FPS_BY_VIDEO)
+
+    # 7) Remove saved dewarp config + preview
+    with DEWARP_LOCK:
+        changed = False
+        if video_id in DEWARP_BY_VIDEO:
+            DEWARP_BY_VIDEO.pop(video_id, None)
+            changed = True
+        if video_id in DEWARP_PREVIEW_BY_VIDEO:
+            DEWARP_PREVIEW_BY_VIDEO.pop(video_id, None)
+        if changed:
+            _save_dewarp_file(DEWARP_BY_VIDEO)
+
+    # 8) Remove saved ROI config
+    with ROI_LOCK:
+        if video_id in ROI_BY_VIDEO:
+            ROI_BY_VIDEO.pop(video_id, None)
+            _save_roi_file()
+
+    # 9) Remove saved schedule config
+    with SCHEDULE_LOCK:
+        if video_id in SCHEDULE_BY_VIDEO:
+            SCHEDULE_BY_VIDEO.pop(video_id, None)
+            _save_schedule_file(SCHEDULE_BY_VIDEO)
+
+    # 10) Remove saved view mode
+    with VIEW_MODE_LOCK:
+        if video_id in VIEW_MODE_BY_VIDEO:
+            VIEW_MODE_BY_VIDEO.pop(video_id, None)
+            _save_view_mode_file(VIEW_MODE_BY_VIDEO)
+
+    # 11) Remove attire events + evidence for this offline video
+    removed_events = []
+    with ATTIRE_EVENTS_LOCK:
+        items = _load_all_attire_events()
+        kept = []
+        for ev in items:
+            if str(ev.get("video_id") or "") == str(video_id):
+                removed_events.append(ev)
+            else:
+                kept.append(ev)
+        if len(kept) != len(items):
+            _rewrite_all_attire_events(kept)
+
+    for ev in removed_events:
+        _safe_remove_file(_event_evidence_abs_path(ev))
+
+    # 12) Clear duplicate/live state related to this video
+    with LIVE_EVENT_STATE_LOCK:
+        dead_keys = [k for k in LIVE_EVENT_STATE.keys() if str(k).startswith(f"{video_id}|")]
+        for k in dead_keys:
+            LIVE_EVENT_STATE.pop(k, None)
+
+    with ATTIRE_NOTIF_LAST_TS_LOCK:
+        dead_keys = [k for k in ATTIRE_NOTIF_LAST_TS.keys() if str(k[0]) == str(video_id)]
+        for k in dead_keys:
+            ATTIRE_NOTIF_LAST_TS.pop(k, None)
+
+    with TRACKS_LOCK:
+        dead_keys = [k for k in TRACKS_BY_VIEW.keys() if str(k[0]) == str(video_id)]
+        for k in dead_keys:
+            TRACKS_BY_VIEW.pop(k, None)
+
+    with ATTIRE_DUPLICATE_INDEX_LOCK:
+        dead_keys = [k for k in ATTIRE_DUPLICATE_INDEX.keys() if str(k).startswith(f"{video_id}|")]
+        for k in dead_keys:
+            ATTIRE_DUPLICATE_INDEX.pop(k, None)
+
+    return {
+        "ok": True,
+        "deleted_id": video_id,
+        "deleted_files": deleted_files,
+        "cleared_events": len(removed_events),
+    }
 
 @app.get("/api/offline/snapshot/{video_id}")
 def offline_snapshot(video_id: str):
@@ -5388,32 +5506,75 @@ async def attire_notifications_stream(request: Request, token: str = ""):
 def get_attire_view_mode(video_id: str):
     saved_mode = _get_view_mode_for_video(video_id)
 
-    detected = False
+    detected = None
+
     try:
         sess = None
         with LIVE_LOCK:
             sess = LIVE_SESSIONS.get(video_id)
 
+        # 1) Prefer already-known runtime detection from active session
         if sess is not None:
-            detected = bool(getattr(sess, "_detected_is_fisheye", False))
-        else:
-            effective = (saved_mode == "fisheye")
-            if saved_mode == "auto":
-                effective = False
-            return {
-                "video_id": video_id,
-                "mode": saved_mode,
-                "effective_mode": "fisheye" if effective else "normal",
-            }
+            runtime_detected = getattr(sess, "_detected_is_fisheye", None)
+            if runtime_detected is not None:
+                detected = bool(runtime_detected)
+
+        # 2) If session not started yet, or detection not ready yet, probe source directly
+        if detected is None:
+            cfg = _get_rtsp(video_id)
+            rtsp_url = (cfg.get("url") or "").strip()
+
+            if rtsp_url:
+                cap = cv2.VideoCapture(rtsp_url)
+                try:
+                    try:
+                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    except Exception:
+                        pass
+
+                    for _ in range(3):
+                        if not cap.grab():
+                            break
+
+                    ok, frame = cap.read()
+                    if ok and frame is not None:
+                        try:
+                            detected = bool(is_fisheye(frame))
+                        except Exception:
+                            detected = False
+                    else:
+                        detected = False
+                finally:
+                    cap.release()
+            else:
+                matches = list(Path(UPLOAD_DIR).glob(f"{video_id}__*"))
+                if matches:
+                    cap = cv2.VideoCapture(str(matches[0]))
+                    try:
+                        ok, frame = cap.read()
+                        if ok and frame is not None:
+                            try:
+                                detected = bool(is_fisheye(frame))
+                            except Exception:
+                                detected = False
+                        else:
+                            detected = False
+                    finally:
+                        cap.release()
+                else:
+                    detected = False
+
     except Exception:
         detected = False
 
-    effective, _ = _resolve_effective_fisheye(video_id, detected)
+    effective, mode_used = _resolve_effective_fisheye(video_id, bool(detected))
 
     return {
         "video_id": video_id,
         "mode": saved_mode,
+        "detected_is_fisheye": bool(detected),
         "effective_mode": "fisheye" if effective else "normal",
+        "mode_used": mode_used,
     }
 
 @app.post("/api/attire/view-mode/{video_id}")
